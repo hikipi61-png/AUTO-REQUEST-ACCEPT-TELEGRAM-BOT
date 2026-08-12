@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """Fast Telegram join-request approval bot.
 
@@ -22,14 +21,16 @@ import os
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import gridfs
 import telebot
-from pymongo import ASCENDING, MongoClient
+from pymongo import ASCENDING, MongoClient, ReturnDocument
+from pymongo.errors import DuplicateKeyError
 from telebot.apihelper import ApiTelegramException
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -82,11 +83,29 @@ JOIN_CHANNEL_URL = os.getenv(
     "JOIN_CHANNEL_URL",
     "https://t.me/+A6klPh9Ms-MwYjBl",
 )
+LOG_CHANNEL_ID = int_env("LOG_CHANNEL_ID", -1003904304764)
 REQUEST_TTL_SECONDS = max(60, int_env("REQUEST_TTL_SECONDS", 290))
-RETRY_DELAY_SECONDS = max(0.15, float(os.getenv("RETRY_DELAY_SECONDS", "0.35")))
-MAX_APPROVE_ATTEMPTS = max(5, int_env("MAX_APPROVE_ATTEMPTS", 240))
-BRAND_ASSET = ASSETS / "raj-bots.png"
-HELP_ASSET = ASSETS / "how-to-add-bot.jpg"
+RETRY_DELAY_SECONDS = max(0.15, float(os.getenv("RETRY_DELAY_SECONDS", "0.15")))
+# The requested fast mode is one initial attempt plus up to 10 total attempts.
+MAX_APPROVE_ATTEMPTS = min(10, max(1, int_env("MAX_APPROVE_ATTEMPTS", 10)))
+
+
+def find_asset(filename: str) -> Path:
+    """Support both the documented assets/ layout and a flat Render repo."""
+    candidates = (
+        ASSETS / filename,
+        ROOT / filename,
+        Path.cwd() / filename,
+        Path.cwd() / "assets" / filename,
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return ASSETS / filename
+
+
+BRAND_ASSET = find_asset("raj-bots.png")
+HELP_ASSET = find_asset("how-to-add-bot.jpg")
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -111,6 +130,10 @@ admins_col = db["admins"]
 media_col = db["media"]
 stats_col = db["approval_stats"]
 media_bucket = gridfs.GridFSBucket(db)
+INSTANCE_ID = f"{os.getpid()}-{uuid.uuid4().hex}"
+POLLING_LOCK_ID = "telegram_polling_lock"
+POLLING_LOCK_TTL_SECONDS = 75
+polling_lock_stop = threading.Event()
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +294,6 @@ def utc_now() -> datetime:
 
 
 def initialize_database() -> None:
-    settings_col.create_index([("key", ASCENDING)], unique=True)
     chats_col.create_index([("chat_id", ASCENDING)], unique=True)
     users_col.create_index([("user_id", ASCENDING)], unique=True)
     events_col.create_index([("chat_id", ASCENDING), ("created_at", ASCENDING)])
@@ -279,6 +301,59 @@ def initialize_database() -> None:
     stats_col.create_index([("chat_id", ASCENDING), ("date", ASCENDING)], unique=True)
     seed_media("brand_image", BRAND_ASSET, "raj-bots.png")
     seed_media("help_image", HELP_ASSET, "how-to-add-bot.jpg")
+
+
+def acquire_polling_lock() -> bool:
+    """Allow only one long-polling process to use this bot token."""
+    now = utc_now()
+    expires_at = now + timedelta(seconds=POLLING_LOCK_TTL_SECONDS)
+    try:
+        document = settings_col.find_one_and_update(
+            {
+                "_id": POLLING_LOCK_ID,
+                "$or": [
+                    {"expires_at": {"$lte": now}},
+                    {"expires_at": {"$exists": False}},
+                    {"instance_id": INSTANCE_ID},
+                ],
+            },
+            {
+                "$set": {
+                    "instance_id": INSTANCE_ID,
+                    "expires_at": expires_at,
+                    "updated_at": now,
+                }
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        return False
+    return bool(document and document.get("instance_id") == INSTANCE_ID)
+
+
+def refresh_polling_lock() -> None:
+    while not polling_lock_stop.wait(25):
+        result = settings_col.update_one(
+            {"_id": POLLING_LOCK_ID, "instance_id": INSTANCE_ID},
+            {
+                "$set": {
+                    "expires_at": utc_now() + timedelta(seconds=POLLING_LOCK_TTL_SECONDS),
+                    "updated_at": utc_now(),
+                }
+            },
+        )
+        if result.matched_count != 1:
+            logging.error("Polling lock was lost; stopping this instance")
+            return
+
+
+def release_polling_lock() -> None:
+    polling_lock_stop.set()
+    try:
+        settings_col.delete_one({"_id": POLLING_LOCK_ID, "instance_id": INSTANCE_ID})
+    except Exception:
+        pass
 
 
 def seed_media(key: str, path: Path, filename: str) -> None:
@@ -547,6 +622,41 @@ def send_request_message(user_chat_id: int, chat_id: int, first_name: str) -> st
     return "failed"
 
 
+def send_final_log(
+    *,
+    chat_id: int,
+    user_id: int,
+    first_name: str,
+    message_status: str,
+    approval_status: str,
+    attempts: int,
+) -> None:
+    """Send one summary only after the request flow is fully finished."""
+    if not LOG_CHANNEL_ID:
+        return
+    chat = chat_doc(chat_id) or {}
+    title = html.escape(str(chat.get("title", chat_id)))
+    user = html.escape(first_name or "User")
+    text = (
+        "<blockquote>📥 <b>JOIN REQUEST COMPLETE</b>\n"
+        f"💬 Chat: <b>{title}</b>\n"
+        f"👤 User: <a href='tg://user?id={user_id}'>{user}</a>\n"
+        f"🖼 Request message: <b>{html.escape(message_status)}</b>\n"
+        f"✅ Approval: <b>{html.escape(approval_status)}</b>\n"
+        f"🔁 Attempts: <b>{attempts}</b>\n"
+        f"⏰ <i>{utc_now().strftime('%Y-%m-%d %H:%M:%S UTC')}</i></blockquote>"
+    )
+    try:
+        bot.send_message(
+            LOG_CHANNEL_ID,
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        logging.warning("Final log could not be sent to LOG_CHANNEL_ID: %s", exc)
+
+
 def error_is_processed(error: str) -> bool:
     lowered = error.lower()
     return any(
@@ -647,6 +757,14 @@ def process_join_request(request: Any) -> None:
             user_id=user_id,
             status=status,
             message_status=message_status,
+            attempts=attempts,
+        )
+        send_final_log(
+            chat_id=chat_id,
+            user_id=user_id,
+            first_name=first_name,
+            message_status=message_status,
+            approval_status=status,
             attempts=attempts,
         )
         logging.info(
@@ -1160,27 +1278,61 @@ def remove_admin_callback(call: Any) -> None:
 # Startup
 # ---------------------------------------------------------------------------
 
+def is_polling_conflict(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "409" in text and "conflict" in text and "getupdates" in text
+
+
 def main() -> None:
     global BOT_USERNAME
     initialize_database()
+    if not acquire_polling_lock():
+        logging.critical(
+            "Another bot instance already owns the polling lock. "
+            "Stop the duplicate Render service/worker before starting this one."
+        )
+        return
+
+    threading.Thread(
+        target=refresh_polling_lock,
+        daemon=True,
+        name="polling-lock-refresh",
+    ).start()
     me = bot.get_me()
     BOT_USERNAME = me.username or os.getenv("BOT_USERNAME", "autorequestapprovebot")
     logging.info("Auto Request Approve Bot started as @%s", BOT_USERNAME)
-    logging.info("Approval retry window: %ss", REQUEST_TTL_SECONDS)
+    logging.info(
+        "Approval mode: up to %s fast attempts, request-message always sent first",
+        MAX_APPROVE_ATTEMPTS,
+    )
 
-    while True:
-        try:
-            bot.infinity_polling(
-                timeout=60,
-                long_polling_timeout=30,
-                allowed_updates=["message", "callback_query", "chat_join_request", "my_chat_member"],
-            )
-        except KeyboardInterrupt:
-            logging.info("Bot stopped")
-            return
-        except Exception:
-            logging.exception("Polling stopped unexpectedly; retrying in 3 seconds")
-            time.sleep(3)
+    try:
+        while True:
+            try:
+                bot.infinity_polling(
+                    timeout=60,
+                    long_polling_timeout=30,
+                    allowed_updates=[
+                        "message",
+                        "callback_query",
+                        "chat_join_request",
+                        "my_chat_member",
+                    ],
+                )
+            except KeyboardInterrupt:
+                logging.info("Bot stopped")
+                return
+            except Exception as exc:
+                if is_polling_conflict(exc):
+                    logging.critical(
+                        "Telegram 409 Conflict: another process is polling this "
+                        "bot token. Exiting so the duplicate cannot keep retrying."
+                    )
+                    return
+                logging.exception("Polling stopped unexpectedly; retrying in 3 seconds")
+                time.sleep(3)
+    finally:
+        release_polling_lock()
 
 
 if __name__ == "__main__":
