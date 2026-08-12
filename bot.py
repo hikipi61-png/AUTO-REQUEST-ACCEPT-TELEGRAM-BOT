@@ -829,13 +829,15 @@ def start_command(message: Any) -> None:
     start_post = setting("start_post")
     if start_post and start_post.get("chat_id") and start_post.get("message_id"):
         try:
-            bot.copy_message(
+            # Use a real forward so Telegram keeps the original channel
+            # attribution/tag and forwarding branding visible to the user.
+            bot.forward_message(
                 message.chat.id,
                 int(start_post["chat_id"]),
                 int(start_post["message_id"]),
             )
         except Exception as exc:
-            logging.warning("Configured start post could not be copied: %s", exc)
+            logging.warning("Configured start post could not be forwarded: %s", exc)
     safe_send_photo(message.chat.id, WELCOME_TEXT, add_bot_buttons())
 
 
@@ -843,6 +845,22 @@ def start_command(message: Any) -> None:
 def help_command(message: Any) -> None:
     if message.chat.type == "private":
         send_help(message.chat.id)
+
+
+@bot.message_handler(commands=["setstart"])
+def set_start_command(message: Any) -> None:
+    if message.chat.type != "private":
+        return
+    if not is_bot_admin(message.from_user.id):
+        bot.reply_to(message, "❌ You are not authorized to set the start post.")
+        return
+    bot.reply_to(
+        message,
+        "Forward the channel post you want to appear on every /start.\n"
+        "Send the forwarded post as your next message.",
+        parse_mode="HTML",
+    )
+    bot.register_next_step_handler(message, save_global_start_post)
 
 
 # ---------------------------------------------------------------------------
@@ -1309,7 +1327,10 @@ def main() -> None:
     try:
         while True:
             try:
-                bot.infinity_polling(
+                # Use non-stop=False so a 409 conflict bubbles out instead of
+                # pyTelegramBotAPI recursively restarting forever.
+                bot.polling(
+                    non_stop=False,
                     timeout=60,
                     long_polling_timeout=30,
                     allowed_updates=[
